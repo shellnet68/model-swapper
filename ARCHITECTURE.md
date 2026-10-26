@@ -142,3 +142,76 @@ Nothing installs itself as a service. The benchmark's allocator fraction and fre
 The lease is released even if metrics cleanup fails. Secondary cleanup failures are attached to the original exception rather than replacing it. Fatal CUDA context errors, such as illegal memory access or driver loss, require a fresh process; the cache does not claim to recover a broken CUDA context.
 
 Run experiments on a dedicated GPU where possible. Close the cache explicitly, keep model files and results outside Git, and verify the live environment before sharing a GPU. This library does not replace an application's serving engine or admission policy.
+
+## Deferred multi-GPU roadmap
+
+**Status: documented for later work; not implemented or multi-GPU tested.** No delivery date or scaling result is claimed.
+
+| Boundary | Current evidence | Proposed next scope |
+|---|---|---|
+| GPU count exercised | One V100, 2026-10-26 | At least two physical GPUs for acceptance |
+| Device selection | `WarmCache(device="cuda:0")` accepts one CUDA device | One worker process and cache per assigned GPU |
+| Concurrent inference | One lease per cache | Independent leases on different GPU workers |
+| Model size | Each model must fit one GPU | Same restriction; no combined GPU memory |
+| Routing | Application chooses a cache | Capacity-aware dispatch across workers |
+| Metrics | Isolated registry per cache | Worker/device identity plus dispatch and health signals |
+
+### Proposed architecture
+
+The diagram shows a proposed two-worker deployment, not an existing API. The number of workers would follow available GPUs.
+
+```mermaid
+flowchart TB
+    App["Application requests"] --> Dispatch["Dispatcher<br/>compatibility and capacity checks"]
+    Dispatch --> W0["Worker process 0<br/>one cache and one lease"]
+    Dispatch --> W1["Worker process 1<br/>one cache and one lease"]
+    W0 --> G0["Assigned GPU 0<br/>one whole active model"]
+    W1 --> G1["Assigned GPU 1<br/>one whole active model"]
+    W0 -.-> RAM["Host RAM admission<br/>sum of worker budgets and overhead"]
+    W1 -.-> RAM
+    W0 -.-> Metrics["Metrics collection<br/>worker and device identity"]
+    W1 -.-> Metrics
+    Dispatch -.-> Metrics
+```
+
+- **Separate processes, explicit devices.** Start workers with a CUDA-safe process start method, not a fork after CUDA initialisation. Each owns its CUDA context, cache, streams and registry. Resolve physical assignments explicitly: device visibility can make a worker's local `cuda:0` refer to a different physical GPU.
+- **Whole models only.** Register a fresh CPU loader in each eligible worker. Do not pass live CUDA modules between workers. Separate `WarmCache` instances on different devices are a possible starting point, but that arrangement has not been validated by the existing suite.
+- **Dispatch to available capacity.** Check model/device compatibility and reserve a worker's capacity before dispatch. Prefer an eligible idle worker with the model hot, then warm, before a cold load. Stale status alone must not allow overlapping leases. Busy capacity remains an explicit refusal unless a bounded queue is designed separately.
+- **Account for the entire host.** Independent workers can duplicate pinned model snapshots. Admit configured RAM budgets together, with room for loaders, allocator rounding and process overhead. Monitor actual host use and locked-memory limits; logical budgets are not hard memory isolation.
+- **Leave room beyond weights.** GPU admission must account for request activations, generation caches, context memory and allocator reservations. A model passing the current logical-weight budget is not proof that its request fits.
+- **Keep failures local.** Stop routing to an unhealthy worker. A broken CUDA context requires replacing that worker process; another healthy worker must remain usable. Do not silently replay a failed request.
+
+### Proposed metrics
+
+These are requirements for future integration, not new metric names or endpoints available today.
+
+| Signal | Required meaning |
+|---|---|
+| Worker/device identity | Stable configured worker and GPU assignment, attached by the application or scrape configuration |
+| Existing activation and memory metrics | Preserve per-worker, per-model cold/warm/hot timing and weight/allocator measurements |
+| Worker health and capacity | Whether a worker can accept a lease, plus failures and restarts |
+| Dispatch decisions and refusals | Selected worker and bounded reason values; never request IDs or prompts as labels |
+| End-to-end request duration | Separate dispatch, model readiness and inference time; first-token latency for streaming text workloads |
+| Physical GPU and host memory | Complement cache gauges with an appropriate GPU exporter and host measurements |
+
+Do not add per-worker CUDA memory gauges together and call that available combined memory for one model. Keep logical pinned weights, estimated pinned allocation, process RSS and physical GPU measurements distinct. If multiple workers expose the same model, preserve worker identity rather than merging their registries without labels.
+
+### Acceptance before advertising support
+
+1. **Real hardware:** run on at least two physical GPUs. Record GPU models, interconnect, runtime versions, precision, workload and source revision. Single-GPU tests or mocks alone do not pass this gate.
+2. **Correct device and parity:** exercise cold, warm and hot paths on each worker. Check weights, buffers and request tensors use its assigned device. Compare outputs with independent same-device loads using a documented precision-appropriate correctness check.
+3. **Independent progress:** run overlapping requests on different workers and show concurrent GPU work. A busy lease on one worker must not block the other. Same-worker overlap must remain refused without corrupting state.
+4. **Capacity boundaries:** test unequal GPU capacities, an unsupported or oversized model, and a host RAM budget exhausted by duplicated snapshots. Admission failure must leave existing healthy models usable.
+5. **Failure isolation:** terminate a worker during a request. Report that request's failure, keep the other worker serving, and verify clean replacement without stale reservations or leaked worker processes.
+6. **Metrics correctness:** scrape workers during switching, overlap and failure. Verify distinct identities, readiness versus total request duration, error counts and memory accounting. No prompts, credentials or private checkpoint paths may enter labels or published results.
+7. **Measured scaling:** compare one-worker and multi-worker runs with the same model mix, request load and budgets. Report throughput, median/p95 latency, output checks and peak RAM/VRAM. Do not promise linear scaling or a speedup before measurement.
+8. **Clean shutdown:** stop admission, finish or explicitly fail active work, then close caches and exit workers. Check process exit and GPU memory recovery.
+
+### Explicit non-goals for this extension
+
+- Splitting one model across GPUs. Tensor parallelism, which divides a model's computation across devices, needs a suitable inference engine and a separate integration.
+- Combining GPU memory into a transparent larger pool, sharing live CUDA tensors between workers, or automatically migrating an active model.
+- Shared pinned snapshots, GPU-to-GPU copies, multi-node scheduling and NVMe/GDS storage tiers.
+- Expanding the existing model-format contract. Quantized, compiled, distributed and engine-specific models remain outside this cache interface.
+
+Implement and test the worker boundary first, then dispatch and metric aggregation. Keep the current single-device path working throughout. Record real multi-GPU evidence before changing the README's supported-capabilities claim.

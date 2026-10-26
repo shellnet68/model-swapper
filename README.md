@@ -37,6 +37,8 @@ flowchart TB
 
 [ARCHITECTURE.md](ARCHITECTURE.md#request-flow) walks one `acquire()` call through the unknown/busy checks, hot reuse, warm copy, cold load and demotion. It also covers state transitions, tensor identity, cleanup, allocator policy and the complete metrics contract.
 
+**Deferred work:** [Multi-GPU roadmap](ARCHITECTURE.md#deferred-multi-gpu-roadmap) describes independent GPU workers, routing, metrics and acceptance criteria. It is a proposal, not current or tested multi-GPU support.
+
 ## Measured switching results
 
 **Model readiness, median milliseconds; lower is better.** Same-process Transformers reload versus the same cache with three policies. V100 PCIe 32 GB, CUDA 12.1, driver 580.178.04, Python 3.12.3, Transformers 4.46.3, FP32/eager attention, two CPU threads, 2026-10-26.
