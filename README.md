@@ -10,17 +10,32 @@
 
 **Keep several supported PyTorch models in pinned CPU RAM and materialise one on the GPU at a time.** Switching skips checkpoint parsing and redundant GPU-to-CPU weight copies. This is an inference-only Python module and benchmark, not a production inference server or scheduler.
 
+## Architecture at a glance
+
 ```mermaid
-flowchart LR
-    Disk["Checkpoint: cold model"] -->|"first activation or RAM eviction"| RAM["Pinned RAM: immutable weights"]
-    RAM -->|"warm activation: copy weights"| GPU["GPU: one leased model"]
-    GPU -->|"inference"| Output["Request output"]
-    GPU -->|"release GPU tensors; retain RAM copy"| RAM
+flowchart TB
+    App["Your application<br/>acquire · inference"]
+    Cache["WarmCache<br/>lease · entry registry"]
+    Loader["Caller loader<br/>fresh CPU nn.Module"]
+    Pinned["Pinned RAM<br/>LRU snapshots"]
+    GPU["GPU<br/>one hot model"]
+    Metrics["CacheMetrics<br/>app may expose"]
+    App -->|"acquire(name)"| Cache
+    Cache -->|"cold only"| Loader
+    Loader -->|"validate, pin once"| Pinned
+    Cache -.->|"cached snapshots"| Pinned
+    Pinned -->|"copy via streams"| GPU
+    GPU -->|"yield in lease"| App
+    Cache -.-> Metrics
 ```
 
-The last arrow describes a state transition, **not another GPU-to-RAM weight copy**. The CPU snapshot already exists. RAM pays for faster switching; the model must still fit the GPU together with its request's activations and cache.
+- **WarmCache** targets one CUDA device and holds one lease lock (one caller at a time per cache) plus an entry registry. Each registered name keeps its loader and, once prepared, its module structure, parameter/buffer bindings and pinned tensors. A warm model is that structure on `meta` tensors plus its pinned snapshot. Pinned tensors reach the GPU on transfer streams (default: one). See `_Entry` and `WarmCache` in [warm_cache.py](warm_cache.py).
+- **Pinned RAM is the source of truth while a model is cached.** The immutable pinned copy is retained while the model is hot. Demotion frees GPU tensors and returns the structure to `meta`; it does **not** copy weights GPU→RAM. The checkpoint is read again only for a cold model.
+- **Returning a lease does not demote the model.** It stays hot until another model is activated or `close()` runs. The next request for the same name reuses it without a copy. Changed bindings are detected at that later demotion.
+- **Budgets are logical weight bytes,** not hardware isolation. LRU eviction of pinned entries happens only while preparing a cold model that would exceed the RAM budget, not on every request. Each model must still fit the GPU together with its request's activations and cache.
+- **Metrics exposure is optional.** The cache always records into its own `CacheMetrics` registry ([metrics.py](metrics.py)); the application decides whether to expose it. There is no built-in HTTP server, request queue or scheduler.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for state transitions, tensor identity, cleanup, allocator policy and the complete metrics contract.
+[ARCHITECTURE.md](ARCHITECTURE.md#request-flow) walks one `acquire()` call through the unknown/busy checks, hot reuse, warm copy, cold load and demotion. It also covers state transitions, tensor identity, cleanup, allocator policy and the complete metrics contract.
 
 ## Measured switching results
 
