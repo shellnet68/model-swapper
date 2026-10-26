@@ -1,0 +1,27 @@
+[project]
+name = "model-swapper"
+version = "0.1.0"
+description = "Independent inference-only pinned-RAM model switching experiment"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12,<3.13"
+dependencies = ["torch==2.5.1", "transformers==4.46.3", "numpy==1.26.4", "prometheus-client==0.21.1"]
+
+[dependency-groups]
+dev = ["pytest==8.3.5"]
+
+[tool.uv]
+package = false
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
